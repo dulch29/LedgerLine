@@ -1,0 +1,9 @@
+flask==3.0.3
+line-bot-sdk==3.11.0
+python-dotenv==1.0.1
+
+# ── Day 2 additions ─────────────────────────────────
+google-genai>=1.0.0          # Gemini API SDK (LLM parsing)
+google-auth>=2.0.0           # Service account authentication
+google-api-python-client>=2.0.0  # Google Sheets API
+gunicorn>=21.2.0             # Production WSGI server for cloud deployment
