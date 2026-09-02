@@ -33,13 +33,15 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,
     ReplyMessageRequest,
     PushMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, ImageMessageContent
 
 import llm_parser
+import llm_vision
 import sheets_client
 import state
 
@@ -130,6 +132,99 @@ def handle_text_message(event):
         _reply(event.reply_token, user_id, reply_text)
 
 
+# ── Image message handler ───────────────────────────────────────────────
+
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    """
+    Handle an image message (receipt photo or bank transfer slip).
+
+    Flow:
+    1. Deduplicate webhook event
+    2. Download image bytes from LINE Blob API
+    3. Analyze image using Gemini Vision (llm_vision.py)
+    4. If not an expense slip: reply with a hint
+    5. If expense slip:
+       a) If user has a recent row (logged via text in past hour):
+          → Attach evidence to that row (Column P)
+          → Reply with confirmation
+       b) If no recent row:
+          → Create a new row with extracted description, amount, evidence
+          → Ask if paid (ใช่/ไม่ใช่)
+    """
+    event_id = getattr(event, "webhook_event_id", None)
+    if event_id:
+        if event_id in _processed_event_ids:
+            logger.info("Ignoring duplicate image webhook event: %s", event_id)
+            return
+        _processed_event_ids.add(event_id)
+        if len(_processed_event_ids) > 1000:
+            _processed_event_ids.pop()
+
+    user_id = event.source.user_id
+    logger.info("Image received from %s (message_id: %s)", user_id, event.message.id)
+
+    # 1. Download image from LINE Blob API
+    try:
+        with ApiClient(configuration) as api_client:
+            line_bot_blob_api = MessagingApiBlob(api_client)
+            image_bytes = line_bot_blob_api.get_message_content(event.message.id)
+    except Exception as e:
+        logger.error("Failed to download image from LINE Blob API: %s", e, exc_info=True)
+        _reply(event.reply_token, user_id, "⚠️ ดาวน์โหลดรูปภาพไม่สำเร็จ กรุณาลองใหม่อีกครั้งครับ")
+        return
+
+    # 2. Analyze with Gemini Vision
+    parsed = llm_vision.analyze_receipt_image(image_bytes)
+    if parsed is None:
+        _reply(
+            event.reply_token,
+            user_id,
+            "🤔 รูปภาพนี้ดูเหมือนไม่ใช่ใบเสร็จหรือสลิปโอนเงินครับ (ลองส่งสลิปโอนเงิน หรือใบเสร็จ 7-Eleven ดูนะ)",
+        )
+        return
+
+    evidence_type = parsed["evidence_type"]
+    amount = parsed.get("amount")
+    description = parsed.get("description") or "ค่าใช้จ่าย"
+
+    # 3. Check if user recently logged an expense to attach this slip to
+    recent_row = state.get_recent_row(user_id)
+
+    if recent_row is not None:
+        try:
+            sheets_client.update_evidence(recent_row, evidence_type)
+            item_num = recent_row - 4
+            reply_text = (
+                f"📎 แนบหลักฐานแล้ว: {evidence_type}\n"
+                f"สำหรับรายการที่ {item_num}"
+            )
+        except Exception as e:
+            logger.error("Failed to update evidence on row %d: %s", recent_row, e)
+            reply_text = f"⚠️ เกิดข้อผิดพลาดในการแนบหลักฐาน: {e}"
+    else:
+        # Photo-first flow: create new expense from image data
+        try:
+            actual_amount = amount if amount is not None else 0.0
+            row_num = sheets_client.append_expense(
+                description=description,
+                amount=actual_amount,
+                evidence=evidence_type,
+            )
+            state.set_pending(user_id, row_num, actual_amount, description)
+            item_num = row_num - 4
+            reply_text = (
+                f"📸 บันทึกจากรูปภาพแล้ว: {description} {actual_amount:,.0f} บาท\n"
+                f"รายการที่ {item_num} (หลักฐาน: {evidence_type})\n"
+                f"จ่ายแล้วหรือยัง? (ใช่/ไม่ใช่)"
+            )
+        except Exception as e:
+            logger.error("Failed to append expense from photo: %s", e)
+            reply_text = f"⚠️ เกิดข้อผิดพลาดในการบันทึกจากรูปภาพ: {e}"
+
+    _reply(event.reply_token, user_id, reply_text)
+
+
 def _handle_confirmation(user_id: str, user_text: str, row: int) -> str:
     """
     Handle a yes/no reply to the "Paid already?" question.
@@ -139,11 +234,14 @@ def _handle_confirmation(user_id: str, user_text: str, row: int) -> str:
     try:
         if text_lower in YES_WORDS:
             sheets_client.update_status(row, "จ่าย")
-            state.clear_pending(user_id)
-            return "บันทึกสถานะแล้ว: จ่ายแล้ว"
+            state.mark_status_confirmed(user_id)
+            return (
+                "บันทึกสถานะแล้ว: จ่ายแล้ว\n"
+                "📸 ส่งรูปใบเสร็จหรือสลิปโอนเงินมาแนบได้เลยนะครับ (ถ้ามี)"
+            )
         elif text_lower in NO_WORDS:
             sheets_client.update_status(row, "รอดำเนินการ")
-            state.clear_pending(user_id)
+            state.mark_status_confirmed(user_id)
             return "บันทึกสถานะแล้ว: รอดำเนินการ"
         else:
             # The user said something unexpected — clear pending state
@@ -190,8 +288,8 @@ def _handle_expense(user_id: str, user_text: str) -> str:
             f"แต่เขียนลง Sheet ไม่ได้\nError: {e}"
         )
 
-    # ── 3. REMEMBER: Store pending confirmation ───────────────────
-    state.set_pending(user_id, row_num)
+    # ── 3. REMEMBER: Store pending confirmation & context ─────────
+    state.set_pending(user_id, row_num, amount, description)
 
     # ── Build reply matching your requested format ────────────────
     item_num = row_num - 4  # Row 5 is Item 1, Row 11 is Item 7, etc.

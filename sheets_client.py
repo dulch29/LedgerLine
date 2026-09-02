@@ -50,6 +50,7 @@ COL_DATE = "L"
 COL_DESCRIPTION = "M"
 COL_AMOUNT = "N"
 COL_STATUS = "O"
+COL_EVIDENCE = "P"
 
 
 # ── Sheets service setup ────────────────────────────────────────────────
@@ -71,24 +72,30 @@ def _get_service():
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    # 1. First check if credentials JSON string is passed via environment variable (ideal for cloud hosts)
-    creds_json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if creds_json_str:
+    # 1. Check if raw JSON was pasted into either env variable
+    creds_json_str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    creds_file_env = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json").strip()
+
+    raw_json = None
+    if creds_json_str.startswith("{"):
+        raw_json = creds_json_str
+    elif creds_file_env.startswith("{"):
+        raw_json = creds_file_env
+
+    if raw_json:
         import json
-        info = json.loads(creds_json_str)
+        info = json.loads(raw_json)
         credentials = service_account.Credentials.from_service_account_info(
             info, scopes=scopes
         )
-    else:
-        # 2. Otherwise load from local key file (for local development)
-        creds_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
-        if not os.path.exists(creds_file):
-            raise RuntimeError(
-                f"Google service account credentials not found.\n"
-                f"Provide GOOGLE_SERVICE_ACCOUNT_JSON env var or place '{creds_file}' in project root."
-            )
+    elif os.path.exists(creds_file_env):
         credentials = service_account.Credentials.from_service_account_file(
-            creds_file, scopes=scopes
+            creds_file_env, scopes=scopes
+        )
+    else:
+        raise RuntimeError(
+            f"Google service account credentials not found.\n"
+            f"Provide GOOGLE_SERVICE_ACCOUNT_JSON env var or place '{creds_file_env}' in project root."
         )
 
     _service = build("sheets", "v4", credentials=credentials)
@@ -179,14 +186,14 @@ def should_write_date(target_row: int) -> bool:
     return True
 
 
-def append_expense(description: str, amount: float) -> int:
+def append_expense(description: str, amount: float, evidence: str | None = None) -> int:
     """
-    Write a new expense to the next empty row in columns K, L, M, N, O.
+    Write a new expense to the next empty row in columns K, L, M, N, O, P.
 
     Steps:
     1. Find the next empty row (where Col M is blank)
     2. Decide if we need to write today's date in Col L
-    3. Write Item # (Col K), Date (Col L), Description (Col M), Amount (Col N)
+    3. Write Item # (Col K), Date (Col L), Description (Col M), Amount (Col N), Evidence (Col P)
     4. Return the row number
     """
     service = _get_service()
@@ -198,8 +205,8 @@ def append_expense(description: str, amount: float) -> int:
     item_num = row_num - 4  # Row 5 is Item 1, Row 11 is Item 7, etc.
 
     logger.info(
-        "Writing expense to row %d (Item #%d): %s ฿%.0f (date: %s)",
-        row_num, item_num, description, amount, "yes" if write_date else "no"
+        "Writing expense to row %d (Item #%d): %s ฿%.0f (date: %s, evidence: %s)",
+        row_num, item_num, description, amount, "yes" if write_date else "no", evidence or "none"
     )
 
     date_value = _today_str() if write_date else ""
@@ -222,6 +229,12 @@ def append_expense(description: str, amount: float) -> int:
             "values": [[amount]],
         },
     ]
+
+    if evidence:
+        data.append({
+            "range": f"{tab}!{COL_EVIDENCE}{row_num}",
+            "values": [[evidence]],
+        })
 
     service.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id,
@@ -292,6 +305,70 @@ def update_status(row_number: int, status: str) -> None:
         logger.warning("Could not apply background color to row %d: %s", row_number, e)
 
     logger.info("Updated row %d status to '%s' with color", row_number, status)
+
+
+def update_evidence(row_number: int, evidence_type: str) -> None:
+    """
+    Update the หลักฐาน (evidence) column for a specific row:
+      - "ใบเสร็จรับเงิน"
+      - "สลิปโอน"
+      - "สลิปเงินสด"
+    """
+    service = _get_service()
+    sheet_id = _get_sheet_id()
+    tab = _get_tab_name()
+
+    cell_range = f"{tab}!{COL_EVIDENCE}{row_number}"
+    service.spreadsheets().values().update(
+        spreadsheetId=sheet_id,
+        range=cell_range,
+        valueInputOption="USER_ENTERED",
+        body={"values": [[evidence_type]]},
+    ).execute()
+
+    logger.info("Updated row %d evidence to '%s'", row_number, evidence_type)
+
+
+def ensure_column_p_dropdown() -> None:
+    """Ensure Data Validation dropdown exists on Column P (rows 5-35)."""
+    try:
+        service = _get_service()
+        sheet_id = _get_sheet_id()
+        tab = _get_tab_name()
+        tab_gid = _get_tab_gid(service, sheet_id, tab)
+        col_index = ord(COL_EVIDENCE.upper()) - ord("A")
+
+        req = [
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": tab_gid,
+                        "startRowIndex": 4,
+                        "endRowIndex": 35,
+                        "startColumnIndex": col_index,
+                        "endColumnIndex": col_index + 1,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [
+                                {"userEnteredValue": "ใบเสร็จรับเงิน"},
+                                {"userEnteredValue": "สลิปโอน"},
+                                {"userEnteredValue": "สลิปเงินสด"},
+                            ],
+                        },
+                        "strict": False,
+                        "showCustomUi": True,
+                    },
+                }
+            }
+        ]
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": req}
+        ).execute()
+        logger.info("Ensured dropdown validation on Column P")
+    except Exception as e:
+        logger.warning("Could not setup Column P dropdown: %s", e)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
