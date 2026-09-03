@@ -25,6 +25,9 @@ This project demonstrates three core agentic AI patterns:
 
 ---
 
+you can try through scanning this QR Code 
+<img width="216" height="218" alt="image" src="https://github.com/user-attachments/assets/a7fcb50a-1d82-4dee-b2d3-9d38e3a56da0" />
+
 ## Setup
 
 ### Prerequisites
